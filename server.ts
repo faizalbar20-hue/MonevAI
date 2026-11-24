@@ -1,9 +1,13 @@
-import express from 'express';
+import express, { type Request, type Response, type NextFunction } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
-import { GoogleGenAI, Type } from '@google/genai';
-import { buildGeminiReportPrompt } from './src/utils/monevLogic';
+import OpenAI from 'openai';
+import {
+  buildOpenAIRecommendPrompt,
+  buildOpenAIReportPrompt,
+  parseOpenAIReportOutput,
+} from './src/utils/monevLogic';
 import type { GeneratedReportSections, MonevReport } from './src/types/monev';
 
 dotenv.config();
@@ -12,76 +16,131 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT || 3000);
+const DEFAULT_OPENAI_MODEL = 'gpt-6-luna';
 
-function getGeminiClient(): GoogleGenAI | null {
-  const apiKey = process.env.GEMINI_API_KEY?.trim();
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
+function getOpenAIModel(): string {
+  return process.env.OPENAI_MODEL?.trim() || DEFAULT_OPENAI_MODEL;
+}
+
+function getOpenAIClient(): OpenAI | null {
+  const apiKey = process.env.OPENAI_API_KEY?.trim();
+  if (!apiKey || apiKey === 'MY_OPENAI_API_KEY') {
     return null;
   }
-  return new GoogleGenAI({
+  return new OpenAI({
     apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
+    timeout: 30_000,
+    maxRetries: 1,
   });
 }
 
-function isTransientGeminiError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return (
-    msg.includes('503') ||
-    msg.includes('UNAVAILABLE') ||
-    msg.includes('429') ||
-    msg.includes('RESOURCE_EXHAUSTED') ||
-    msg.includes('high demand')
-  );
+function createAiRateLimiter(options: { maxRequests: number; windowMs: number }) {
+  const buckets = new Map<string, { count: number; resetAt: number }>();
+
+  return (req: Request, res: Response, next: NextFunction) => {
+    const forwarded = req.headers['x-forwarded-for'];
+    const rawIp = Array.isArray(forwarded)
+      ? forwarded[0]
+      : typeof forwarded === 'string'
+        ? forwarded.split(',')[0]
+        : req.ip;
+    const clientKey = (rawIp || 'local').trim();
+    const now = Date.now();
+
+    const existing = buckets.get(clientKey);
+    if (!existing || now > existing.resetAt) {
+      buckets.set(clientKey, { count: 1, resetAt: now + options.windowMs });
+      return next();
+    }
+
+    if (existing.count >= options.maxRequests) {
+      const retrySeconds = Math.max(1, Math.ceil((existing.resetAt - now) / 1000));
+      return res.status(429).json({
+        error: `Batas penggunaan AI tercapai. Silakan coba lagi dalam ${retrySeconds} detik.`,
+      });
+    }
+
+    existing.count += 1;
+    return next();
+  };
 }
 
-async function callWithRetry<T>(fn: () => Promise<T>, maxAttempts = 3): Promise<T> {
+function isTransientOpenAIError(err: unknown): boolean {
+  if (err instanceof OpenAI.APIConnectionError || err instanceof OpenAI.APIConnectionTimeoutError) {
+    return true;
+  }
+  if (err instanceof OpenAI.APIError) {
+    return err.status === 429 || err.status === 500 || err.status === 502 || err.status === 503;
+  }
+  return false;
+}
+
+async function callWithRetry<T>(fn: () => Promise<T>, maxAttempts = 2): Promise<T> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       return await fn();
     } catch (err) {
       lastError = err;
-      if (!isTransientGeminiError(err) || attempt === maxAttempts) {
+      if (!isTransientOpenAIError(err) || attempt === maxAttempts) {
         throw err;
       }
-      const delayMs = 700 * Math.pow(2, attempt - 1);
+      const delayMs = 650 * attempt;
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
   }
   throw lastError;
 }
 
-function formatGeminiError(err: unknown): { status: number; message: string } {
-  const raw = err instanceof Error ? err.message : String(err);
-  if (raw.includes('503') || raw.includes('UNAVAILABLE') || raw.includes('high demand')) {
+function formatOpenAIError(err: unknown): { status: number; message: string } {
+  if (err instanceof OpenAI.AuthenticationError) {
     return {
-      status: 503,
+      status: 401,
       message:
-        'Layanan Gemini AI sedang mengalami lonjakan permintaan sementara. Silakan klik Generate Laporan kembali dalam beberapa detik, atau sunting isi laporan secara manual.',
+        'Autentikasi OpenAI API gagal. Periksa kembali konfigurasi OPENAI_API_KEY di server.',
     };
   }
-  if (raw.includes('429') || raw.includes('RESOURCE_EXHAUSTED')) {
-    return {
-      status: 429,
-      message:
-        'Batas kuota permintaan Gemini AI tercapai sementara. Silakan tunggu sejenak sebelum mencoba lagi.',
-    };
-  }
-  if (raw.includes('API_KEY_INVALID') || raw.includes('403') || raw.includes('PERMISSION_DENIED')) {
+  if (err instanceof OpenAI.PermissionDeniedError) {
     return {
       status: 403,
       message:
-        'Kunci API Gemini tidak valid atau tidak memiliki izin. Periksa pengaturan di panel Secrets.',
+        'Akses ke model OpenAI ditolak oleh server API. Periksa izin proyek atau kunci API di server.',
+    };
+  }
+  if (err instanceof OpenAI.RateLimitError) {
+    return {
+      status: 429,
+      message:
+        'Batas permintaan atau kuota OpenAI API tercapai sementara. Silakan tunggu sejenak sebelum mencoba lagi.',
+    };
+  }
+  if (err instanceof OpenAI.NotFoundError) {
+    return {
+      status: 502,
+      message:
+        'Model OpenAI yang dikonfigurasi tidak ditemukan. Periksa variabel OPENAI_MODEL di server.',
+    };
+  }
+  if (err instanceof OpenAI.APIConnectionTimeoutError || err instanceof OpenAI.APIConnectionError) {
+    return {
+      status: 503,
+      message:
+        'Tidak dapat terhubung ke layanan OpenAI API. Periksa koneksi jaringan server dan coba lagi.',
+    };
+  }
+  if (err instanceof OpenAI.APIError) {
+    const status = err.status && err.status >= 400 ? err.status : 502;
+    return {
+      status,
+      message:
+        status >= 500
+          ? 'Layanan OpenAI API sedang mengalami gangguan sementara. Silakan coba lagi beberapa saat lagi.'
+          : 'Permintaan ke OpenAI API tidak dapat diproses. Silakan periksa input dan coba kembali.',
     };
   }
   return {
     status: 500,
-    message: 'Terjadi kendala saat menghubungi layanan Gemini AI. Silakan coba lagi.',
+    message: 'Terjadi kendala internal saat memproses laporan dengan OpenAI API.',
   };
 }
 
@@ -89,41 +148,51 @@ async function startServer() {
   const app = express();
   app.use(express.json({ limit: '1mb' }));
 
+  const aiRateLimiter = createAiRateLimiter({
+    maxRequests: 20,
+    windowMs: 60_000,
+  });
+
   app.get('/api/health', (_req, res) => {
-    const apiKey = process.env.GEMINI_API_KEY?.trim();
-    const aiReady = Boolean(apiKey && apiKey !== 'MY_GEMINI_API_KEY');
+    const aiReady = Boolean(getOpenAIClient());
+    const aiModel = getOpenAIModel();
     const monevPortalConfigured = Boolean(process.env.MONEV_API_URL?.trim());
 
     res.json({
       serverOnline: true,
       aiReady,
+      aiProvider: 'OpenAI',
+      aiModel,
       monevPortalConfigured,
       checkedAt: new Date().toISOString(),
       message: aiReady
-        ? 'Terhubung ke server & Gemini AI siap digunakan.'
-        : 'Server aktif, namun kunci Gemini AI belum dikonfigurasi.',
+        ? `Terhubung ke server & OpenAI (${aiModel}) siap digunakan.`
+        : 'Server aktif, namun OPENAI_API_KEY belum dikonfigurasi.',
     });
   });
 
-  app.post('/api/generate-report', async (req, res) => {
-    const ai = getGeminiClient();
-    if (!ai) {
+  app.post('/api/generate-report', aiRateLimiter, async (req, res) => {
+    const client = getOpenAIClient();
+    if (!client) {
       return res.status(503).json({
         error:
-          'GEMINI_API_KEY belum tersedia di server. Silakan atur pada panel Secrets agar Gemini AI dapat menghasilkan laporan.',
+          'OPENAI_API_KEY belum tersedia di server. Silakan atur pada environment variable server agar OpenAI AI Assistant dapat menghasilkan laporan.',
       });
     }
 
-    const body = req.body as {
-      reportDate?: string;
-      selectedActivities?: string[];
-      previousReports?: MonevReport[];
+    const body = (req.body ?? {}) as {
+      reportDate?: unknown;
+      selectedActivities?: unknown;
+      previousReports?: unknown;
       previousDraft?: GeneratedReportSections;
-      isRegenerate?: boolean;
+      isRegenerate?: unknown;
     };
 
     const selectedActivities = Array.isArray(body.selectedActivities)
-      ? body.selectedActivities.map((a) => String(a).trim()).filter(Boolean)
+      ? body.selectedActivities
+          .map((a) => String(a).trim().slice(0, 300))
+          .filter(Boolean)
+          .slice(0, 25)
       : [];
 
     if (selectedActivities.length === 0) {
@@ -132,10 +201,16 @@ async function startServer() {
       });
     }
 
-    const reportDate = body.reportDate || new Date().toISOString().slice(0, 10);
-    const previousReports = Array.isArray(body.previousReports) ? body.previousReports : [];
+    const reportDate =
+      typeof body.reportDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(body.reportDate)
+        ? body.reportDate
+        : new Date().toISOString().slice(0, 10);
+    const previousReports = Array.isArray(body.previousReports)
+      ? (body.previousReports as MonevReport[]).slice(0, 10)
+      : [];
 
-    const prompt = buildGeminiReportPrompt({
+    const model = getOpenAIModel();
+    const prompt = buildOpenAIReportPrompt({
       reportDate,
       selectedActivities,
       previousReports,
@@ -145,126 +220,147 @@ async function startServer() {
 
     try {
       const response = await callWithRetry(() =>
-        ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
-          contents: prompt,
-          config: {
-            systemInstruction:
-              'Anda adalah asisten penyusun laporan absensi harian Monitoring & Evaluasi (Monev) berbahasa Indonesia yang profesional, jujur, ringkas, dan faktual. Jangan pernah mengarang kegiatan yang tidak diberikan pengguna, dan hindari pengulangan kalimat dari riwayat sebelumnya.',
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                deskripsiKegiatan: {
-                  type: Type.STRING,
-                  description:
-                    'Deskripsi kegiatan harian dalam bahasa Indonesia yang natural dan profesional, hanya memuat aktivitas yang diberikan pengguna (2-4 kalimat).',
+        client.responses.create({
+          model,
+          instructions:
+            'Anda adalah asisten penyusun laporan absensi harian Monitoring & Evaluasi (Monev) untuk Staff PPIC berbahasa Indonesia yang profesional, natural, variatif, dan faktual. Jangan mengarang aktivitas atau kendala yang tidak diberikan pengguna. Jika informasi kendala belum tersedia, minta konfirmasi pengguna pada bagian kendala tanpa mengasumsikan hambatan.',
+          input: prompt,
+          text: {
+            format: {
+              type: 'json_schema',
+              name: 'auto_monev_daily_report',
+              strict: true,
+              schema: {
+                type: 'object',
+                properties: {
+                  deskripsi_kegiatan: {
+                    type: 'string',
+                    description:
+                      'Deskripsi kegiatan harian Staff PPIC dalam bahasa Indonesia yang natural dan profesional, hanya berdasarkan aktivitas yang dipilih pengguna.',
+                  },
+                  pembelajaran: {
+                    type: 'string',
+                    description:
+                      'Pembelajaran yang didapat dari pelaksanaan aktivitas PPIC hari ini.',
+                  },
+                  kendala: {
+                    type: 'string',
+                    description:
+                      'Kendala yang dialami jika tercantum pada input pengguna; jika belum tersedia, tulis pesan konfirmasi agar pengguna meninjau atau melengkapi kendala secara manual.',
+                  },
                 },
-                pembelajaran: {
-                  type: Type.STRING,
-                  description:
-                    'Pembelajaran atau insight yang didapat dari kegiatan yang dilakukan (1-3 kalimat).',
-                },
-                kendala: {
-                  type: Type.STRING,
-                  description:
-                    'Kendala atau tantangan yang relevan langsung dengan aktivitas yang dilakukan (1-2 kalimat).',
-                },
+                required: ['deskripsi_kegiatan', 'pembelajaran', 'kendala'],
+                additionalProperties: false,
               },
-              required: ['deskripsiKegiatan', 'pembelajaran', 'kendala'],
             },
           },
         })
       );
 
-      const rawText = (response.text ?? '').trim();
-      if (!rawText) {
-        return res.status(502).json({
-          error: 'Gemini AI mengembalikan respons kosong. Silakan coba kembali.',
-        });
-      }
+      const rawText = (response.output_text ?? '').trim();
+      const sections = parseOpenAIReportOutput(rawText);
 
-      const parsed = JSON.parse(rawText) as GeneratedReportSections;
-      if (
-        !parsed.deskripsiKegiatan?.trim() ||
-        !parsed.pembelajaran?.trim() ||
-        !parsed.kendala?.trim()
-      ) {
-        return res.status(502).json({
-          error: 'Format hasil laporan AI tidak lengkap. Silakan coba generate ulang.',
-        });
-      }
-
-      return res.json({ sections: parsed });
+      return res.json({
+        sections,
+        output: {
+          deskripsi_kegiatan: sections.deskripsiKegiatan,
+          pembelajaran: sections.pembelajaran,
+          kendala: sections.kendala,
+        },
+        model,
+      });
     } catch (error) {
-      const formatted = formatGeminiError(error);
+      const formatted = formatOpenAIError(error);
+      console.error(`[OpenAI /api/generate-report] Error status=${formatted.status}`);
       return res.status(formatted.status).json({
         error: formatted.message,
       });
     }
   });
 
-  app.post('/api/recommend-activities', async (req, res) => {
-    const ai = getGeminiClient();
-    if (!ai) {
+  app.post('/api/recommend-activities', aiRateLimiter, async (req, res) => {
+    const client = getOpenAIClient();
+    if (!client) {
       return res.status(503).json({
         error:
-          'GEMINI_API_KEY belum tersedia di server. Gunakan daftar rekomendasi dari riwayat atau tambahkan kegiatan manual.',
+          'OPENAI_API_KEY belum tersedia di server. Gunakan daftar rekomendasi dari riwayat atau tambahkan aktivitas manual.',
       });
     }
 
-    const body = req.body as {
-      previousReports?: MonevReport[];
-      existingLabels?: string[];
+    const body = (req.body ?? {}) as {
+      previousReports?: unknown;
+      existingLabels?: unknown;
     };
 
-    const previousReports = Array.isArray(body.previousReports) ? body.previousReports : [];
-    const existingLabels = Array.isArray(body.existingLabels) ? body.existingLabels : [];
+    const previousReports = Array.isArray(body.previousReports)
+      ? (body.previousReports as MonevReport[]).slice(0, 10)
+      : [];
+    const existingLabels = Array.isArray(body.existingLabels)
+      ? body.existingLabels.map((l) => String(l).trim().slice(0, 200)).filter(Boolean).slice(0, 30)
+      : [];
 
-    const historyText = previousReports
-      .slice(0, 6)
-      .map((r) => `- (${r.reportDate}): ${r.activities.join('; ')}`)
-      .join('\n');
+    const model = getOpenAIModel();
+    const prompt = buildOpenAIRecommendPrompt({
+      previousReports,
+      existingLabels,
+    });
 
     try {
       const response = await callWithRetry(() =>
-        ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
-          contents: `Berdasarkan riwayat pekerjaan sebelumnya berikut:\n${historyText || '- Pelaporan evaluasi harian'}\n\nDan daftar kegiatan yang sudah tampil saat ini (hindari duplikasi persis):\n${existingLabels.join('; ') || '-'}\n\nBerikan 3 rekomendasi kegiatan harian Monev yang realistis dan relevan untuk dilanjutkan hari ini dalam Bahasa Indonesia.`,
-          config: {
-            systemInstruction:
-              'Berikan rekomendasi kegiatan kerja harian Monev yang ringkas, realistis, dan profesional dalam bahasa Indonesia.',
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
+        client.responses.create({
+          model,
+          instructions:
+            'Berikan 3 rekomendasi aktivitas harian yang relevan untuk Staff PPIC dalam bahasa Indonesia yang ringkas, realistis, dan profesional.',
+          input: prompt,
+          text: {
+            format: {
+              type: 'json_schema',
+              name: 'ppic_activity_recommendations',
+              strict: true,
+              schema: {
+                type: 'object',
                 properties: {
-                  label: {
-                    type: Type.STRING,
-                    description: 'Nama kegiatan singkat dan jelas (maksimal 12 kata).',
-                  },
-                  category: {
-                    type: Type.STRING,
-                    description: 'Kategori singkat: Monev, Koordinasi, Teknis, atau Operasional.',
+                  recommendations: {
+                    type: 'array',
+                    items: {
+                      type: 'object',
+                      properties: {
+                        label: {
+                          type: 'string',
+                          description: 'Nama aktivitas Staff PPIC singkat dan jelas.',
+                        },
+                        category: {
+                          type: 'string',
+                          description: 'Kategori singkat: PPIC, Monev, Koordinasi, Teknis, atau Operasional.',
+                        },
+                      },
+                      required: ['label', 'category'],
+                      additionalProperties: false,
+                    },
                   },
                 },
-                required: ['label', 'category'],
+                required: ['recommendations'],
+                additionalProperties: false,
               },
             },
           },
         })
       );
 
-      const rawText = (response.text ?? '[]').trim();
-      const recommendations = JSON.parse(rawText) as Array<{
-        label: string;
-        category: string;
-      }>;
+      const rawText = (response.output_text ?? '{}').trim();
+      const parsed = JSON.parse(rawText) as {
+        recommendations?: Array<{ label: string; category: string }>;
+      };
+      const recommendations = Array.isArray(parsed.recommendations)
+        ? parsed.recommendations
+            .filter((item) => item?.label?.trim())
+            .slice(0, 4)
+        : [];
 
-      return res.json({ recommendations: recommendations.slice(0, 4) });
+      return res.json({ recommendations, model });
     } catch (error) {
-      const formatted = formatGeminiError(error);
+      const formatted = formatOpenAIError(error);
+      console.error(`[OpenAI /api/recommend-activities] Error status=${formatted.status}`);
       return res.status(formatted.status).json({ error: formatted.message });
     }
   });

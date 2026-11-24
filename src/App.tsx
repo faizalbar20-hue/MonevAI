@@ -200,19 +200,19 @@ export default function App() {
       setReportStatus('Menunggu Review');
       setUserApproved(false);
       setEditorFeedback({
-        type: 'info',
+        type: 'success',
         message: isRegenerate
-          ? 'Laporan berhasil disusun ulang dengan variasi kalimat baru. Silakan tinjau sebelum mengirim.'
-          : 'Laporan AI berhasil dibuat. Anda dapat mengedit teks secara langsung sebelum menyetujui pengiriman.',
+          ? 'Berhasil menghasilkan laporan ulang dengan variasi kalimat baru. Silakan tinjau sebelum mengirim.'
+          : 'Berhasil menghasilkan laporan. Anda dapat mengedit ketiga bagian laporan sebelum menyetujui pengiriman.',
       });
     } catch (err) {
       const message =
         err instanceof Error
           ? err.message
-          : 'Terjadi kesalahan saat membuat laporan AI.';
+          : 'Terjadi kesalahan saat menghubungi layanan AI.';
       setEditorFeedback({
         type: 'error',
-        message,
+        message: `Gagal menghasilkan laporan: ${message}`,
       });
     } finally {
       setIsGenerating(false);

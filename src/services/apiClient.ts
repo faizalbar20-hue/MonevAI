@@ -48,7 +48,7 @@ export async function requestGenerateReport(payload: {
 
   if (!res.ok || !data.sections) {
     throw new Error(
-      data.error || 'Gagal menghasilkan laporan dari layanan Gemini AI.'
+      data.error || 'Gagal menghasilkan laporan dari layanan OpenAI AI.'
     );
   }
 
@@ -72,7 +72,7 @@ export async function requestRecommendActivities(payload: {
 
   if (!res.ok || !data.recommendations) {
     throw new Error(
-      data.error || 'Gagal mengambil rekomendasi kegiatan dari Gemini AI.'
+      data.error || 'Gagal mengambil rekomendasi aktivitas dari OpenAI AI.'
     );
   }
 

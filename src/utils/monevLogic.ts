@@ -89,6 +89,20 @@ export function deriveRecommendedActivities(
 export function inferActivityCategory(label: string): string {
   const lower = label.toLowerCase();
   if (
+    lower.includes('ppic') ||
+    lower.includes('stok') ||
+    lower.includes('inventory') ||
+    lower.includes('mrp') ||
+    lower.includes('mps') ||
+    lower.includes('produksi') ||
+    lower.includes('bahan baku') ||
+    lower.includes('gudang') ||
+    lower.includes('pengiriman') ||
+    lower.includes('lead time')
+  ) {
+    return 'PPIC';
+  }
+  if (
     lower.includes('rapat') ||
     lower.includes('koordinasi') ||
     lower.includes('diskusi') ||
@@ -117,7 +131,47 @@ export function inferActivityCategory(label: string): string {
   return 'Operasional';
 }
 
-export function buildGeminiReportPrompt(params: {
+export interface OpenAIReportJsonOutput {
+  deskripsi_kegiatan: string;
+  pembelajaran: string;
+  kendala: string;
+}
+
+export function parseOpenAIReportOutput(rawText: string): GeneratedReportSections {
+  const trimmed = rawText.trim();
+  if (!trimmed) {
+    throw new Error('Respons AI kosong.');
+  }
+
+  let parsed: Partial<OpenAIReportJsonOutput> & { deskripsiKegiatan?: string };
+  try {
+    parsed = JSON.parse(trimmed) as Partial<OpenAIReportJsonOutput> & {
+      deskripsiKegiatan?: string;
+    };
+  } catch {
+    throw new Error('Format JSON dari OpenAI Responses API tidak valid.');
+  }
+
+  const deskripsiKegiatan = (
+    parsed.deskripsi_kegiatan ??
+    parsed.deskripsiKegiatan ??
+    ''
+  ).trim();
+  const pembelajaran = (parsed.pembelajaran ?? '').trim();
+  const kendala = (parsed.kendala ?? '').trim();
+
+  if (!deskripsiKegiatan || !pembelajaran || !kendala) {
+    throw new Error('Struktur output laporan dari AI belum lengkap.');
+  }
+
+  return {
+    deskripsiKegiatan,
+    pembelajaran,
+    kendala,
+  };
+}
+
+export function buildOpenAIReportPrompt(params: {
   reportDate: string;
   selectedActivities: string[];
   previousReports: MonevReport[];
@@ -147,27 +201,53 @@ export function buildGeminiReportPrompt(params: {
 
   const regenerateBlock =
     isRegenerate && previousDraft
-      ? `\nCatatan Generate Ulang:\nBuat variasi penyusunan kalimat yang baru dan segar dibanding draf sebelumnya berikut, tanpa mengubah fakta kegiatan:\n- Draf Deskripsi sebelumnya: "${previousDraft.deskripsiKegiatan}"\n- Draf Pembelajaran sebelumnya: "${previousDraft.pembelajaran}"\n- Draf Kendala sebelumnya: "${previousDraft.kendala}"\n`
+      ? `\nCatatan Generate Ulang:\nBuat variasi penyusunan kalimat yang baru dan segar dibanding draf sebelumnya berikut, tanpa mengubah fakta aktivitas:\n- Draf Deskripsi sebelumnya: "${previousDraft.deskripsiKegiatan}"\n- Draf Pembelajaran sebelumnya: "${previousDraft.pembelajaran}"\n- Draf Kendala sebelumnya: "${previousDraft.kendala}"\n`
       : '';
 
-  return `Tanggal Laporan: ${formatIndonesianDate(reportDate, true)} (${reportDate})
+  return `Peran Pengguna: Staff PPIC (Production Planning & Inventory Control).
+Tanggal Laporan: ${formatIndonesianDate(reportDate, true)} (${reportDate})
 
-Daftar kegiatan yang BENAR-BENAR dilakukan pengguna hari ini:
+Daftar aktivitas AKTUAL yang dikonfirmasi dan dilakukan pengguna hari ini:
 ${activityLines}
 
-Riwayat kalimat laporan sebelumnya (WAJIB dihindari pengulangan frasa/kalimat yang sama):
+Riwayat laporan sebelumnya (HANYA sebagai referensi konteks gaya bahasa & anti-pengulangan — JANGAN menganggap aktivitas lama sebagai aktivitas hari ini):
 ${recentSamples || '- Belum ada riwayat laporan sebelumnya.'}
 ${regenerateBlock}
 Tugas Anda:
-Susun laporan absensi harian Monev dalam bahasa Indonesia yang natural, lugas, dan profesional dalam 3 bagian JSON:
-1. deskripsiKegiatan: Rangkuman jelas dan terstruktur hanya berdasarkan daftar kegiatan di atas. DILARANG keras menambahkan, mengarang, atau mengasumsikan aktivitas lain di luar daftar.
-2. pembelajaran: Wawasan atau hal teknis/non-teknis yang dipelajari secara realistis dari pelaksanaan kegiatan di atas.
-3. kendala: Hambatan atau tantangan yang relevan langsung dengan kegiatan di atas (jika kegiatan berjalan lancar tanpa hambatan spesifik dalam input, tulis kendala operasional ringan yang relevan dengan konteks kegiatan tersebut tanpa mengarang insiden besar).
+Hasilkan objek JSON dengan tepat 3 properti:
+1. "deskripsi_kegiatan": Rangkuman kegiatan harian Staff PPIC dalam bahasa Indonesia yang natural, variatif, lugas, dan profesional, HANYA berdasarkan daftar aktivitas aktual hari ini di atas. DILARANG mengarang atau menambahkan aktivitas yang tidak diberikan pengguna.
+2. "pembelajaran": Pembelajaran atau wawasan kerja PPIC yang realistis dan relevan dengan pelaksanaan aktivitas aktual di atas.
+3. "kendala": Jika informasi kendala disebutkan secara jelas di dalam aktivitas yang diberikan pengguna, tuliskan kendala tersebut secara akurat. Namun, jika informasi kendala belum tersedia pada input aktivitas pengguna, JANGAN mengarang atau mengasumsikan kendala — tuliskan kalimat konfirmasi agar pengguna meninjau dan melengkapi bagian kendala secara manual sebelum dikirim.
 
 Aturan ketat:
-- Jangan gunakan gaya bahasa kaku atau berulang dari riwayat laporan sebelumnya.
-- Jangan mengarang angka, nama pihak eksternal, atau peristiwa yang tidak disebutkan pengguna.`;
+- Gunakan bahasa Indonesia yang natural, profesional, dan bervariasi (tidak monoton).
+- Hindari pengulangan kalimat atau frasa dari riwayat laporan sebelumnya.
+- Jangan pernah memasukkan aktivitas dari riwayat lama sebagai pekerjaan hari ini kecuali memang tercantum pada daftar aktivitas aktual di atas.`;
 }
+
+export function buildOpenAIRecommendPrompt(params: {
+  previousReports: MonevReport[];
+  existingLabels: string[];
+}): string {
+  const { previousReports, existingLabels } = params;
+  const historyText = [...previousReports]
+    .sort((a, b) => b.reportDate.localeCompare(a.reportDate))
+    .slice(0, 6)
+    .map((r) => `- (${r.reportDate}): ${r.activities.join('; ')}`)
+    .join('\n');
+
+  return `Peran Pengguna: Staff PPIC (Production Planning & Inventory Control).
+
+Riwayat aktivitas dari laporan sebelumnya (sebagai referensi konteks):
+${historyText || '- Penyusunan jadwal produksi dan pengendalian persediaan harian'}
+
+Daftar aktivitas yang sudah tampil saat ini (hindari duplikasi persis):
+${existingLabels.join('; ') || '-'}
+
+Berikan 3 rekomendasi aktivitas harian yang relevan untuk pekerjaan Staff PPIC (misalnya perencanaan jadwal produksi/MPS, pemantauan stok bahan baku/MRP, koordinasi pengiriman dengan gudang/pembelian, atau evaluasi realisasi produksi & lead time) yang selaras dengan riwayat di atas dalam Bahasa Indonesia yang ringkas dan profesional.`;
+}
+
+export const buildGeminiReportPrompt = buildOpenAIReportPrompt;
 
 export function filterReports(
   reports: MonevReport[],

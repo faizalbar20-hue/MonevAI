@@ -1,12 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  buildGeminiReportPrompt,
+  buildOpenAIRecommendPrompt,
+  buildOpenAIReportPrompt,
   canSubmitReport,
   deriveRecommendedActivities,
   filterReports,
   formatIndonesianDate,
   getAvailableYears,
+  inferActivityCategory,
+  parseOpenAIReportOutput,
   validateActivitiesSelection,
 } from './monevLogic';
 import type { ActivityItem, MonevReport } from '../types/monev';
@@ -116,17 +119,55 @@ test('canSubmitReport blocks submission without complete sections or user approv
   assert.equal(canSubmitReport(fullSections, true).valid, true);
 });
 
-test('buildGeminiReportPrompt embeds selected activities and anti-repetition history', () => {
-  const prompt = buildGeminiReportPrompt({
+test('buildOpenAIReportPrompt embeds PPIC context, anti-repetition, and non-fabricated kendala rule', () => {
+  const prompt = buildOpenAIReportPrompt({
     reportDate: '2026-11-23',
-    selectedActivities: ['Finalisasi dokumen evaluasi triwulan IV'],
+    selectedActivities: ['Pemantauan stok bahan baku lini produksi A'],
     previousReports: sampleReports,
     isRegenerate: true,
     previousDraft: sampleReports[0].sections,
   });
-  assert.match(prompt, /Finalisasi dokumen evaluasi triwulan IV/);
-  assert.match(prompt, /DILARANG keras menambahkan, mengarang/);
+  assert.match(prompt, /Staff PPIC/);
+  assert.match(prompt, /Pemantauan stok bahan baku lini produksi A/);
+  assert.match(prompt, /DILARANG mengarang atau menambahkan aktivitas/);
+  assert.match(prompt, /JANGAN mengarang atau mengasumsikan kendala/);
   assert.match(prompt, /Catatan Generate Ulang/);
+});
+
+test('buildOpenAIRecommendPrompt references PPIC role and history', () => {
+  const prompt = buildOpenAIRecommendPrompt({
+    previousReports: sampleReports,
+    existingLabels: ['Monitoring stok'],
+  });
+  assert.match(prompt, /Staff PPIC/);
+  assert.match(prompt, /Monitoring stok/);
+});
+
+test('parseOpenAIReportOutput parses snake_case OpenAI structured JSON into GeneratedReportSections', () => {
+  const parsed = parseOpenAIReportOutput(
+    JSON.stringify({
+      deskripsi_kegiatan: 'Memantau stok bahan baku dan menyusun jadwal produksi.',
+      pembelajaran: 'Pembaruan data stok real-time mencegah kekurangan material.',
+      kendala: 'Belum ada informasi kendala yang dicantumkan; mohon tinjau secara manual.',
+    })
+  );
+  assert.equal(
+    parsed.deskripsiKegiatan,
+    'Memantau stok bahan baku dan menyusun jadwal produksi.'
+  );
+  assert.equal(
+    parsed.pembelajaran,
+    'Pembaruan data stok real-time mencegah kekurangan material.'
+  );
+  assert.throws(() => parseOpenAIReportOutput('not-json'), /tidak valid/);
+  assert.throws(
+    () => parseOpenAIReportOutput(JSON.stringify({ deskripsi_kegiatan: 'Ada', pembelajaran: '', kendala: 'Ada' })),
+    /belum lengkap/
+  );
+});
+
+test('inferActivityCategory detects PPIC activities', () => {
+  assert.equal(inferActivityCategory('Pemantauan stok bahan baku gudang'), 'PPIC');
 });
 
 test('formatIndonesianDate formats ISO date into Indonesian locale string', () => {

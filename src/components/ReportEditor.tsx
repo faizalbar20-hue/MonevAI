@@ -109,25 +109,38 @@ export function ReportEditor({
           </div>
         </div>
 
-        {/* Feedback Banner */}
-        {feedback && (
+        {/* Processing / Feedback Banner */}
+        {isGenerating ? (
           <div
-            role={feedback.type === 'error' ? 'alert' : 'status'}
-            className={`mt-4 flex items-start gap-2.5 rounded-xl border px-3.5 py-3 text-xs font-medium ${
-              feedback.type === 'error'
-                ? 'border-rose-200 bg-rose-50 text-rose-800'
-                : feedback.type === 'success'
-                  ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
-                  : 'border-blue-200 bg-blue-50 text-blue-900'
-            }`}
+            role="status"
+            aria-live="polite"
+            className="mt-4 flex items-center gap-2.5 rounded-xl border border-blue-200 bg-blue-50 px-3.5 py-3 text-xs font-medium text-blue-900"
           >
-            {feedback.type === 'error' ? (
-              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-600" aria-hidden="true" />
-            ) : (
-              <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-blue-600" aria-hidden="true" />
-            )}
-            <p className="leading-relaxed">{feedback.message}</p>
+            <Loader2 className="h-4 w-4 shrink-0 animate-spin text-blue-600" aria-hidden="true" />
+            <p className="leading-relaxed">
+              Sedang memproses aktivitas terpilih dan menyusun laporan dengan OpenAI AI...
+            </p>
           </div>
+        ) : (
+          feedback && (
+            <div
+              role={feedback.type === 'error' ? 'alert' : 'status'}
+              className={`mt-4 flex items-start gap-2.5 rounded-xl border px-3.5 py-3 text-xs font-medium ${
+                feedback.type === 'error'
+                  ? 'border-rose-200 bg-rose-50 text-rose-800'
+                  : feedback.type === 'success'
+                    ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                    : 'border-blue-200 bg-blue-50 text-blue-900'
+              }`}
+            >
+              {feedback.type === 'error' ? (
+                <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-rose-600" aria-hidden="true" />
+              ) : (
+                <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-blue-600" aria-hidden="true" />
+              )}
+              <p className="leading-relaxed">{feedback.message}</p>
+            </div>
+          )
         )}
 
         {/* Three Editable Report Sections */}

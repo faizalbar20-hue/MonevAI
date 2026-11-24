@@ -37,6 +37,8 @@ export interface MonevReport {
 export interface ConnectionHealth {
   serverOnline: boolean;
   aiReady: boolean;
+  aiProvider?: string;
+  aiModel?: string;
   monevPortalConfigured: boolean;
   checkedAt: string;
   message: string;
